@@ -1,0 +1,8 @@
+results.tsv
+run.log
+*.log
+.hive/
+__pycache__/
+*.pyc
+*.so
+*.cu
