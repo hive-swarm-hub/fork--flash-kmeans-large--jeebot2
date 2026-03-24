@@ -147,9 +147,9 @@ def batch_kmeans_Euclid(
             phases.append((1, D // 2))
             phases.append((2, D))
         else:
-            # large-dense: skip D/4, reduce D/2 to 2 iters
-            phases.append((2, D // 2))
-            phases.append((2, D))
+            # large-dense: 3 D/2 + 1 D (D/2 is 2x cheaper than D)
+            phases.append((3, D // 2))
+            phases.append((1, D))
     elif D >= 64 and max_iters >= 2:
         phases.append((max_iters - 1, D // 2))
         phases.append((1, D))
