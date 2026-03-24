@@ -139,17 +139,17 @@ def batch_kmeans_Euclid(
     phases = []
     if D >= 128 and max_iters >= 6:
         if K <= 1024:
-            # large-scale: very tolerant — skip D/2
-            phases.append((max_iters - 2, D // 4))
+            # large-scale: very tolerant — skip D/2, 1 D/4 warmup
+            phases.append((1, D // 4))
             phases.append((2, D))
         elif K > 4096:
-            # stress: needs D/2 bridge
-            phases.append((max_iters - 3, D // 4))
+            # stress: needs D/2 bridge, 1 D/4 warmup
+            phases.append((1, D // 4))
             phases.append((1, D // 2))
             phases.append((2, D))
         else:
-            # large-dense (K~4096): tightest constraint, keep D/2 phase
-            phases.append((max_iters - 5, D // 4))
+            # large-dense (K~4096): tightest constraint, 1 D/4 warmup
+            phases.append((1, D // 4))
             phases.append((3, D // 2))
             phases.append((2, D))
     elif D >= 64 and max_iters >= 2:
