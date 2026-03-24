@@ -3,6 +3,14 @@ import torch
 import triton
 import triton.language as tl
 
+# Set Triton allocator for TMA support
+def _triton_alloc(size, alignment, stream):
+    return torch.empty(size, dtype=torch.uint8, device="cuda")
+try:
+    triton.set_allocator(_triton_alloc)
+except Exception:
+    pass
+
 # ===============================================================
 # Triton kernel: compute nearest-centroid IDs (Euclidean distance)
 # Inputs:
@@ -239,15 +247,11 @@ def _euclid_assign_kernel(
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    COMPUTE_CSQ: tl.constexpr = False,
 ):
-    """Each program handles a tile of BLOCK_N points for a given batch element.
-
-    The kernel iterates over the centroid dimension K in chunks of BLOCK_K and
-    maintains the running minimum distance as well as the corresponding index
-    for every point in the tile.
-    """
-    pid_n = tl.program_id(0)          # tile index along N dimension
-    pid_b = tl.program_id(1)          # batch index
+    """Each program handles a tile of BLOCK_N points for a given batch element."""
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
     pid_b = pid_b.to(tl.int64)
 
     n_start = pid_n * BLOCK_N
@@ -255,61 +259,49 @@ def _euclid_assign_kernel(
     n_offsets = n_offsets.to(tl.int64)
     n_mask = n_offsets < N
 
-    # ------------------------------------------------------------------
-    # Load x tile  (BLOCK_N, D)
-    # ------------------------------------------------------------------
     offs_d = tl.arange(0, D).to(tl.int64)
-    # Compute pointer for x block: base + b*stride_x_b + n*stride_x_n + d*stride_x_d
     x_ptrs = (
         x_ptr
         + pid_b * stride_x_b
         + n_offsets[:, None] * stride_x_n
         + offs_d[None, :] * stride_x_d
     )
-    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
-    x_tile = x_tile  # compute in f32
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
 
-    # Pre-load x_sq for the tile  (BLOCK_N,)
-    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
+    if not COMPUTE_CSQ:
+        xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
+        x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
 
-    # Init best distance / index
-    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)  # large number
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
 
-    # ------------------------------------------------------------------
-    # Iterate over centroids in chunks of BLOCK_K
-    # ------------------------------------------------------------------
     for k_start in range(0, K, BLOCK_K):
         k_offsets = k_start + tl.arange(0, BLOCK_K)
         k_offsets = k_offsets.to(tl.int64)
         k_mask = k_offsets < K
 
-        # Load centroid tile  (D, BLOCK_K)
         c_ptrs = (
             c_ptr
             + pid_b * stride_c_b
             + k_offsets[None, :] * stride_c_k
             + offs_d[:, None] * stride_c_d
         )
-        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0)
-        c_tile = c_tile
+        c_tile = tl.load(c_ptrs, mask=k_mask[None, :], other=0.0, eviction_policy="evict_first")
 
-        # load c_sq for the tile  (BLOCK_K,)
-        csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
-        cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        if COMPUTE_CSQ:
+            cent_sq = tl.sum(c_tile.to(tl.float32) * c_tile.to(tl.float32), axis=0)
+        else:
+            csq_ptrs = c_sq_ptr + pid_b * stride_csq_b + k_offsets * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-        # # Compute centroid squared norms (BLOCK_K,)
-        # cent_sq = tl.sum(c_tile * c_tile, axis=0).to(tl.float32)
+        cross = tl.dot(x_tile, c_tile).to(tl.float32)
 
-        # Compute cross term (BLOCK_N, BLOCK_K) = x_tile @ c_tile
-        cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
+        if COMPUTE_CSQ:
+            dist = cent_sq[None, :] - 2.0 * cross
+        else:
+            dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
+            dist = tl.maximum(dist, 0.0)
 
-        # Squared Euclidean distance
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.maximum(dist, 0.0)
-
-        # Mask out invalid centroid columns before reduction
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
 
         curr_min = tl.min(dist, axis=1)
@@ -319,13 +311,98 @@ def _euclid_assign_kernel(
         best_dist = tl.where(update, curr_min, best_dist)
         best_idx = tl.where(update, k_start + curr_idx, best_idx)
 
-    # ------------------------------------------------------------------
-    # Write results
-    # ------------------------------------------------------------------
     out_ptrs = out_ptr + pid_b * stride_out_b + n_offsets * stride_out_n
     tl.store(out_ptrs, best_idx, mask=n_mask)
 
 _euclid_assign_kernel_autotuned = triton.autotune(_TUNE_CONFIGS, key=["N", "K"])(_euclid_assign_kernel)
+
+
+@triton.jit
+def _min_argmin_combine(val_a, idx_a, val_b, idx_b):
+    use_b = val_b < val_a
+    return tl.where(use_b, val_b, val_a), tl.where(use_b, idx_b, idx_a)
+
+
+@triton.jit
+def _euclid_assign_kernel_tma(
+    x_ptr, c_ptr, x_sq_ptr, c_sq_ptr, out_ptr,
+    B: tl.constexpr, N: tl.constexpr, K: tl.constexpr, D: tl.constexpr,
+    stride_x_b: tl.constexpr, stride_x_n: tl.constexpr, stride_x_d: tl.constexpr,
+    stride_c_b: tl.constexpr, stride_c_k: tl.constexpr, stride_c_d: tl.constexpr,
+    stride_xsq_b: tl.constexpr, stride_xsq_n: tl.constexpr,
+    stride_csq_b: tl.constexpr, stride_csq_k: tl.constexpr,
+    stride_out_b: tl.constexpr, stride_out_n: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SKIP_CSQ: tl.constexpr = False,
+):
+    """FA3-style assignment kernel using TMA for async centroid loads."""
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_b_i64 = pid_b.to(tl.int64)
+
+    n_start = pid_n * BLOCK_N
+    n_offsets = n_start + tl.arange(0, BLOCK_N).to(tl.int64)
+    n_mask = n_offsets < N
+
+    # TMA descriptor for centroids - Triton handles pingpong via num_stages
+    cent_desc = tl.make_tensor_descriptor(
+        c_ptr + pid_b_i64 * stride_c_b,
+        shape=[K, D], strides=[stride_c_k, stride_c_d], block_shape=[BLOCK_K, D],
+    )
+
+    # Load x_tile via standard load (registers, saves SMEM for TMA staging)
+    offs_d = tl.arange(0, D).to(tl.int64)
+    x_ptrs = x_ptr + pid_b_i64 * stride_x_b + n_offsets[:, None] * stride_x_n + offs_d[None, :] * stride_x_d
+    x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_last")
+
+    # x_sq not needed — constant across K, doesn't affect argmin
+    best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), tl.int32)
+
+    k_remainder = K % BLOCK_K
+    k_full = K - k_remainder
+    csq_base = c_sq_ptr + pid_b_i64 * stride_csq_b
+
+    for k_start in range(0, k_full, BLOCK_K):
+        c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
+        cross = tl.dot(x_tile, c_tile, input_precision="ieee")
+        if SKIP_CSQ:
+            dist = -cross  # approximate: max similarity = min distance
+        else:
+            csq_ptrs = csq_base + (k_start + tl.arange(0, BLOCK_K)).to(tl.int64) * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, eviction_policy="evict_first").to(tl.float32)
+            dist = cent_sq[None, :] - 2.0 * cross
+        # Fused min+argmin: single reduction pass instead of two
+        _k_idx = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
+        curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx, dist.shape)),
+                                        axis=1, combine_fn=_min_argmin_combine)
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, curr_idx, best_idx)
+
+    if k_remainder > 0:
+        k_start = k_full
+        k_offsets = k_start + tl.arange(0, BLOCK_K)
+        k_mask = k_offsets < K
+        c_tile = tl.trans(tl.load_tensor_descriptor(cent_desc, [k_start, 0]))
+        cross = tl.dot(x_tile, c_tile, input_precision="ieee")
+        if SKIP_CSQ:
+            dist = -cross
+        else:
+            csq_ptrs = csq_base + k_offsets.to(tl.int64) * stride_csq_k
+            cent_sq = tl.load(csq_ptrs, mask=k_mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
+            dist = cent_sq[None, :] - 2.0 * cross
+        dist = tl.where(k_mask[None, :], dist, 3.4e38)
+        _k_idx2 = tl.arange(0, BLOCK_K).to(tl.int32)[None, :] + k_start
+        curr_min, curr_idx = tl.reduce((dist, tl.broadcast_to(_k_idx2, dist.shape)),
+                                        axis=1, combine_fn=_min_argmin_combine)
+        update = curr_min < best_dist
+        best_dist = tl.where(update, curr_min, best_dist)
+        best_idx = tl.where(update, curr_idx, best_idx)
+
+    out_ptrs = out_ptr + pid_b_i64 * stride_out_b + n_offsets * stride_out_n
+    tl.store(out_ptrs, best_idx, mask=n_mask)
+
 
 @triton.jit
 def _cosine_assign_kernel(
@@ -547,6 +624,34 @@ def euclid_assign_triton(
             stride_out_b,
             stride_out_n,
         )
+    return out
+
+
+def euclid_assign_tma(
+    x: torch.Tensor, centroids: torch.Tensor, x_sq: torch.Tensor,
+    out: torch.Tensor = None, c_sq: torch.Tensor = None,
+) -> torch.Tensor:
+    """Assignment using TMA async loads (FA3-style)."""
+    B, N, D = x.shape
+    K = centroids.shape[1]
+    if out is None:
+        out = torch.empty((B, N), device=x.device, dtype=torch.int32)
+    if c_sq is None:
+        c_sq = (centroids.to(torch.float32) ** 2).sum(-1)
+    centroids = centroids.contiguous()
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
+    bk = 64 if K <= 1024 else 128
+    _euclid_assign_kernel_tma[grid](
+        x, centroids, x_sq, c_sq, out,
+        B, N, K, D,
+        x.stride(0), x.stride(1), x.stride(2),
+        centroids.stride(0), centroids.stride(1), centroids.stride(2),
+        x_sq.stride(0), x_sq.stride(1),
+        c_sq.stride(0), c_sq.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_N=128, BLOCK_K=bk,
+        num_warps=4, num_stages=1,
+    )
     return out
 
 
