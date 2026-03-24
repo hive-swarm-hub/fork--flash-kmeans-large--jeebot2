@@ -166,7 +166,8 @@ def batch_kmeans_Euclid(
         x_use = x[:, :, :D_use]
         sxu_b, sxu_n, sxu_d = x_use.stride()
 
-        bk = 128  # BK=128 optimal for all D with fused min+argmin reduction
+        # BK=64 for small K (reduces SMEM, fits more blocks/SM); BK=128 for large K
+        bk = assign_bk  # 64 if K<=1024 else 128
 
         # For cheap D/4 iterations: update centroids every 2 iters to save scatter_add cost
         # For D/4 phase: centroids don't change between updates, so only need
